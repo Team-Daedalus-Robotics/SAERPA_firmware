@@ -2,7 +2,7 @@
   Heltec WiFi LoRa 32 V3/V3.2 - Receiver / Gateway Wi-Fi -> REST POST
   Protocolo LoRa: id;ds18b20=VAL;dht_temp=VAL;dht_ur=VAL;solo=VAL
   Receiver calcula timestamp UTC da chegada por NTP (Wi-Fi).
-  Um pacote LoRa se transforma em ate 4 POSTs no esquema JSON original da Jetson.
+  Um pacote LoRa se transforma em um unico HTTP POST com payload em array.
   Endpoint HTTP na LAN da Jetson (configurar IP/porta/caminho).
 */
 #include <Arduino.h>
@@ -11,6 +11,7 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <HT_SSD1306Wire.h>
+#include "Amostras.h"
 
 // OLED SSD1306 embutido: SDA=17, SCL=18, RST=21, Vext=36.
 // Usa a biblioteca de display fornecida pela Heltec ESP32 Dev-Boards.
@@ -51,7 +52,6 @@ struct PacotePendente {
   char dados[MAX_PACOTE + 1];
   char timestamp[21]; // UTC da chegada, ou preenchido depois da sincronizacao
   uint32_t chegadaMs;
-  uint8_t proximoCampo; // proximo sensor a enviar por HTTP; evita repetir POST ja aceito
 };
 static PacotePendente fila[FILA_TAMANHO];
 static bool ntpConfigurado = false;
@@ -111,7 +111,6 @@ bool enfileirar(const uint8_t* dados, uint16_t tamanho) {
   memcpy(p.dados, dados, tamanho);
   p.dados[tamanho] = '\0';
   p.chegadaMs = millis();
-  p.proximoCampo = 0;
   p.timestamp[0] = '\0';
   // Mesmo se o sinalizador ainda nao foi atualizado, use a hora valida.
   obterTimestampUTC(p.timestamp, sizeof(p.timestamp));
@@ -148,12 +147,6 @@ bool inteiro(const String& s, long& n, long minimo, long maximo) {
   n = v;
   return true;
 }
-
-struct Amostras {
-  uint32_t id;
-  bool valido[4];
-  long valor[4];
-};
 
 const char* const CHAVES[4] = {"ds18b20=", "dht_temp=", "dht_ur=", "solo="};
 const char* const MODELOS[4] = {"ds18b20", "dht11", "dht11", "solo_cap_v2"};
@@ -193,18 +186,24 @@ bool decodificarPacote(const char* texto, Amostras& amostras) {
   return true;
 }
 
-// Preserva o contrato HTTP anterior: JSON individual por medida, embora
-// todas as medidas viajem juntas em um unico pacote LoRa.
-String criarJSON(const Amostras& amostras, uint8_t i, const char* timestamp) {
-  String json;
-  json.reserve(250);
+// Contrato JSON atualizado: um unico documento por lote LoRa.
+// Leituras NA sao omitidas. Retorna false quando nao existe nenhuma medida valida.
+bool criarJSON(const Amostras& amostras, const char* timestamp, String& json) {
   json = "{\"id_estacao\":" + String(amostras.id) +
-         ",\"timestamp\":\"" + String(timestamp) + "\"" +
-         ",\"payload\":{\"valor\":" + String(amostras.valor[i]) +
-         ",\"modelo_sensor\":\"" + String(MODELOS[i]) +
-         "\",\"unidade_de_medida\":\"" + String(UNIDADES[i]) +
-         "\",\"medida\":\"" + String(MEDIDAS[i]) + "\"}}";
-  return json;
+         ",\"timestamp\":\"" + String(timestamp) + "\",\"payload\":[";
+  json.reserve(480);
+  uint8_t incluidas = 0;
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (!amostras.valido[i]) continue;
+    if (incluidas > 0) json += ',';
+    json += "{\"valor\":" + String(amostras.valor[i]) +
+            ",\"modelo_sensor\":\"" + String(MODELOS[i]) +
+            "\",\"unidade_de_medida\":\"" + String(UNIDADES[i]) +
+            "\",\"medida\":\"" + String(MEDIDAS[i]) + "\"}";
+    ++incluidas;
+  }
+  json += "]}";
+  return incluidas > 0;
 }
 
 void atualizarRelogio() {
@@ -320,26 +319,23 @@ void loop() {
     if (!obterTimestampUTC(p.timestamp, sizeof(p.timestamp), agora - idadeSegundos)) return;
   }
 
-  // Um lote LoRa, ate quatro registros HTTP, mantendo schema da Jetson.
-  // Registros ja confirmados com 2xx nao sao reenviados se outro falhar.
-  for (uint8_t i = p.proximoCampo; i < 4; ++i) {
-    if (!amostras.valido[i]) {
-      p.proximoCampo = i + 1;
-      continue;
-    }
-    String json = criarJSON(amostras, i, p.timestamp);
-    Serial.printf("[RX] Lote %lu, campo %u: %s\n",
-                  (unsigned long)amostras.id, i + 1, p.dados);
-    Serial.printf("[JSON] %s\n", json.c_str());
-    if (!enviarPOST(json)) {
-      proximoPOST = millis() + 5000;
-      atualizarOLED(true);
-      return;
-    }
-    p.proximoCampo = i + 1;
-    Radio.IrqProcess();
+  // Uma recepcao LoRa gera somente um POST com todas as medidas validas.
+  String json;
+  if (!criarJSON(amostras, p.timestamp, json)) {
+    Serial.println("[RX] Pacote sem medicoes validas; nenhum POST enviado.");
+    retirarPacote();
+    atualizarOLED(true);
+    return;
   }
-  Serial.printf("[RX] Lote processado, UTC da chegada: %s\n", p.timestamp);
+  Serial.printf("[RX] Lote %lu: %s\n", (unsigned long)amostras.id, p.dados);
+  Serial.printf("[JSON] %s\n", json.c_str());
+  if (!enviarPOST(json)) {
+    // Mantem o lote na fila e repete um unico POST na proxima tentativa.
+    proximoPOST = millis() + 5000;
+    atualizarOLED(true);
+    return;
+  }
+  Serial.printf("[RX] Lote confirmado via HTTP, UTC da chegada: %s\n", p.timestamp);
   retirarPacote();
   proximoPOST = millis();
   atualizarOLED(true);
