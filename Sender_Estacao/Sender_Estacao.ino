@@ -272,7 +272,7 @@ bool carregarLeituras() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== SENDER HELTEC V3 ===");
+  Serial.println("\n=== SENDER HELTEC V3 | PACOTE UNICO | SEM Wi-Fi/NTP ===");
   dht.begin();
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
   iniciarOLED();

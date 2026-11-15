@@ -10,6 +10,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <time.h>
+#include <esp_sntp.h>
 #include <HT_SSD1306Wire.h>
 #include "Amostras.h"
 
@@ -45,7 +46,7 @@ const char* JETSON_URL = "http://192.168.1.100:8000/api/medicoes";
 #define LORA_IQ_INVERSION_ON false
 
 static RadioEvents_t eventosRadio;
-static bool iniciarRecepcao = true;
+static volatile bool iniciarRecepcao = true;
 static constexpr size_t MAX_PACOTE = 180;
 static constexpr uint8_t FILA_TAMANHO = 8;
 struct PacotePendente {
@@ -56,7 +57,9 @@ struct PacotePendente {
 static PacotePendente fila[FILA_TAMANHO];
 static bool ntpConfigurado = false;
 static bool horaPronta = false;
+static volatile bool ntpConfirmado = false; // true somente apos resposta SNTP real
 static unsigned long ultimaChecagemHora = 0;
+static unsigned long inicioEsperaNTP = 0;
 static uint8_t inicioFila = 0;
 static uint8_t fimFila = 0;
 static uint8_t quantidadeFila = 0;
@@ -66,7 +69,9 @@ static uint32_t pacotesRecebidos = 0, pacotesDescartados = 0;
 static unsigned long ultimaRecepcao = 0;
 static int16_t ultimoRSSI = 0;
 static int8_t ultimoSNR = 0;
-static char ultimaMedicao[32] = "--";
+static char ultimaMedicao[40] = "--";
+static char ultimoSolo[24] = "Solo: --";
+static uint32_t pacotesInvalidos = 0;
 static char ultimoPOST[16] = "PENDENTE";
 
 void atualizarOLED(bool forcar = false) {
@@ -83,8 +88,9 @@ void atualizarOLED(bool forcar = false) {
                 millis() - ultimaRecepcao < 30000 ? "RX recente" : "sem RX recente");
   oled.drawString(0, 22, linha);
   oled.drawString(0, 33, String(ultimaMedicao));
-  if (pacotesRecebidos) snprintf(linha, sizeof(linha), "RSSI:%d SNR:%d", ultimoRSSI, ultimoSNR);
-  else snprintf(linha, sizeof(linha), "RSSI:-- SNR:--");
+  // Durante recepcao, mostre solo e sinal.
+  if (pacotesRecebidos) snprintf(linha, sizeof(linha), "%s R:%d", ultimoSolo, ultimoRSSI);
+  else snprintf(linha, sizeof(linha), "Solo: -- R:--");
   oled.drawString(0, 44, linha);
   snprintf(linha, sizeof(linha), "W:%s N:%s H:%s",
            WiFi.status() == WL_CONNECTED ? "OK" : "OFF",
@@ -112,8 +118,8 @@ bool enfileirar(const uint8_t* dados, uint16_t tamanho) {
   p.dados[tamanho] = '\0';
   p.chegadaMs = millis();
   p.timestamp[0] = '\0';
-  // Mesmo se o sinalizador ainda nao foi atualizado, use a hora valida.
-  obterTimestampUTC(p.timestamp, sizeof(p.timestamp));
+  // So carimbar imediatamente quando houve sincronizacao SNTP nesta inicializacao.
+  if (horaPronta) obterTimestampUTC(p.timestamp, sizeof(p.timestamp));
   fimFila = (fimFila + 1) % FILA_TAMANHO;
   ++quantidadeFila;
   return true;
@@ -125,8 +131,8 @@ void onRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snr) {
     ultimaRecepcao = millis();
     ultimoRSSI = rssi;
     ultimoSNR = snr;
-    Serial.printf("[RX] Pacote unico recebido: %u bytes | RSSI=%d dBm | SNR=%d dB\n",
-                  size, rssi, snr);
+    Serial.printf("[RX] %u bytes | RSSI=%d dBm | SNR=%d dB | bruto: %s\n",
+                  size, rssi, snr, fila[(fimFila + FILA_TAMANHO - 1) % FILA_TAMANHO].dados);
   } else {
     ++pacotesDescartados;
     Serial.println("[RX] Pacote descartado: tamanho invalido ou fila cheia.");
@@ -206,25 +212,41 @@ bool criarJSON(const Amostras& amostras, const char* timestamp, String& json) {
   return incluidas > 0;
 }
 
+// O callback e chamado quando o ESP32 recebe uma resposta SNTP.
+// Wi-Fi conectado nao implica NTP sincronizado.
+void onNTPSincronizado(struct timeval* tv) {
+  if (tv != nullptr && tv->tv_sec >= 1704067200) ntpConfirmado = true;
+}
+
 void atualizarRelogio() {
   if (WiFi.status() != WL_CONNECTED) {
     ntpConfigurado = false;
-    // Uma vez acertado, o RTC do ESP32 segue contando mesmo sem Wi-Fi.
-    horaPronta = (time(nullptr) >= 1704067200);
+    // Se sincronizou antes, o relogio continua contando; manter esse estado.
+    horaPronta = ntpConfirmado && time(nullptr) >= 1704067200;
     return;
   }
   if (!ntpConfigurado) {
+    // Registrado ANTES de iniciar o cliente NTP.
+    sntp_set_time_sync_notification_cb(onNTPSincronizado);
     configTime(0, 0, "a.ntp.br", "pool.ntp.org", "time.google.com");
     ntpConfigurado = true;
+    inicioEsperaNTP = millis();
     ultimaChecagemHora = 0;
-    Serial.println("[NTP] Solicitando horario UTC...");
+    Serial.printf("[NTP] Consultando horario UTC. IP=%s, Gateway=%s, DNS=%s\n",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),
+                  WiFi.dnsIP().toString().c_str());
   }
-  if (millis() - ultimaChecagemHora >= 2000 || ultimaChecagemHora == 0) {
+  if (ultimaChecagemHora == 0 || millis() - ultimaChecagemHora >= 5000) {
     ultimaChecagemHora = millis();
-    char ts[21];
-    bool valido = obterTimestampUTC(ts, sizeof(ts));
-    if (valido && !horaPronta) Serial.printf("[NTP] UTC sincronizado: %s\n", ts);
-    horaPronta = valido;
+    bool prontoAgora = ntpConfirmado && time(nullptr) >= 1704067200;
+    if (prontoAgora && !horaPronta) {
+      char ts[21];
+      if (obterTimestampUTC(ts, sizeof(ts))) Serial.printf("[NTP] UTC sincronizado: %s\n", ts);
+    } else if (!prontoAgora && millis() - inicioEsperaNTP >= 15000) {
+      Serial.println("[NTP] Ainda sem resposta: verifique acesso a UDP/123, DNS ou portal cativo da rede.");
+    }
+    horaPronta = prontoAgora;
   }
 }
 
@@ -232,7 +254,7 @@ void iniciarWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.printf("[Wi-Fi] Conectando em %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID); // rede aberta; para rede protegida use WiFi.begin(ssid, senha)
+  WiFi.begin(WIFI_SSID); // Rede aberta; para WPA2, usar WiFi.begin(WIFI_SSID, senha).
   ultimaTentativaWiFi = millis();
 }
 
@@ -270,7 +292,6 @@ void setup() {
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
   iniciarOLED();
   atualizarOLED(true);
-  iniciarWiFi();
   eventosRadio.RxDone = onRxDone;
   eventosRadio.RxTimeout = onRxTimeout;
   eventosRadio.RxError = onRxError;
@@ -279,6 +300,11 @@ void setup() {
   Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, LORA_SPREADING_FACTOR,
                     LORA_CODINGRATE, 0, LORA_PREAMBLE_LENGTH, 0,
                     false, 0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
+  // Iniciar escuta imediatamente, sem depender de Wi-Fi ou NTP.
+  Radio.Rx(0);
+  iniciarRecepcao = false;
+  iniciarWiFi();
+  Serial.println("[LoRa] RX ativo em 915 MHz, SF7, BW125, CR4/5, CRC ON, IQ normal.");
 }
 
 void loop() {
@@ -297,13 +323,26 @@ void loop() {
   PacotePendente& p = fila[inicioFila];
   Amostras amostras{};
   if (!decodificarPacote(p.dados, amostras)) {
-    Serial.printf("[PROTOCOLO] Lote invalido: %s\n", p.dados);
+    ++pacotesInvalidos;
+    Serial.printf("[PROTOCOLO] Pacote invalido (%lu): %s\n", (unsigned long)pacotesInvalidos, p.dados);
+    if (strstr(p.dados, ";UNSYNCED;") != nullptr) {
+      Serial.println("[PROTOCOLO] Sender com firmware ANTIGO: regrave o Sender de pacote unico.");
+      snprintf(ultimaMedicao, sizeof(ultimaMedicao), "SENDER ANTIGO!");
+    } else {
+      snprintf(ultimaMedicao, sizeof(ultimaMedicao), "RX protocolo invalido");
+    }
     retirarPacote();
+    atualizarOLED(true);
     return;
   }
-  snprintf(ultimaMedicao, sizeof(ultimaMedicao), "DS:%s DHT:%s",
+  // Exibir informacoes validas de RX mesmo quando Wi-Fi/NTP/HTTP estiverem indisponiveis.
+  snprintf(ultimaMedicao, sizeof(ultimaMedicao), "DS:%s DHT:%s U:%s",
            amostras.valido[0] ? String(amostras.valor[0]).c_str() : "--",
-           amostras.valido[1] ? String(amostras.valor[1]).c_str() : "--");
+           amostras.valido[1] ? String(amostras.valor[1]).c_str() : "--",
+           amostras.valido[2] ? String(amostras.valor[2]).c_str() : "--");
+  snprintf(ultimoSolo, sizeof(ultimoSolo), "Solo:%s",
+           amostras.valido[3] ? String(amostras.valor[3]).c_str() : "--");
+  atualizarOLED(true);
 
   if (!p.timestamp[0]) {
     if (!horaPronta) {
