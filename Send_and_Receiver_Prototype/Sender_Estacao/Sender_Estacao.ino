@@ -52,7 +52,7 @@ const uint32_t ID_ESTACAO = 1001;
 // DS18B20: GPIO4 + resistor 4k7 entre DATA e 3V3.
 // DHT11: GPIO5 + pull-up se o modulo nao tiver.
 // Solo capacitivo V2.0: AOUT no GPIO6 (ADC1_CH5), sinal maximo 3,3 V.
-#define PIN_DS18B20 4
+#define PIN_DS18B20 7
 #define PIN_DHT11 5
 #define PIN_SOLO 6
 // A calibracao do solo e armazenada na NVS, nao usa valores ficticios.
@@ -203,7 +203,7 @@ bool carregarLeituras() {
       if (dsEncontrado) {
         Serial.println("[DS18B20] Sensor encontrado no barramento 1-Wire.");
       } else {
-        Serial.println("[DS18B20] Nenhum sensor encontrado. Verifique GPIO4, 3V3, GND e pull-up 4k7.");
+        Serial.println("[DS18B20] Nenhum sensor encontrado. Verifique GPIO7, 3V3, GND e pull-up 4k7.");
       }
     }
 
