@@ -104,6 +104,18 @@ Design and implement a modular embedded telemetry subsystem that acquires local 
 
 Sensor power and GPIO signals must remain within ESP32-S3 electrical limits (3.3 V logic). The project uses a calibrated **relative soil-moisture percentage**, not a direct measurement of volumetric water content.
 
+### Hardware prototype — wiring diagram
+
+The following Fritzing diagram illustrates the **physical sensor-station prototype** using a Heltec ESP32-S3 board, a DS18B20 temperature probe, a DHT11 temperature/humidity sensor, and a capacitive soil-moisture sensor. It documents the intended wiring arrangement for the acquisition node (Sender), not the separate Receiver/Jetson gateway.
+
+<p align="center">
+  <img src="assets/prototype-wiring.png" alt="SAERPA Sender hardware prototype — Heltec ESP32-S3 connected to DS18B20, DHT11, and capacitive soil-moisture sensors on a breadboard" width="850">
+</p>
+
+<p align="center"><em>Figure 1 — Sensor-station prototype wiring (Fritzing).</em></p>
+
+> **Hardware validation:** This is a prototype wiring illustration. Before powering the circuit, verify the module-specific pinout, common ground, supply voltage, pull-up resistors, and signal-to-GPIO mapping against the hardware-interface table above.
+
 ### LoRa reference settings
 
 | Parameter | Configuration |
